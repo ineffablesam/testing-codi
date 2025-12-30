@@ -1,0 +1,168 @@
+name: Deploy Flutter Web
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: 'Deployment target'
+        required: true
+        default: 'github_pages'
+        type: choice
+        options:
+          - github_pages
+          - vercel
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      build_success: ${{ steps.build.outcome == 'success' }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+          cache-key: 'flutter-:os:-:channel:-:version:-:arch:-:hash:'
+          cache-path: '${{ runner.tool_cache }}/flutter/:channel:-:version:-:arch:'
+
+      - name: Verify Flutter installation
+        run: |
+          flutter --version
+          flutter doctor -v
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Analyze code
+        run: flutter analyze --no-fatal-infos
+        continue-on-error: true
+
+      - name: Run tests
+        run: flutter test
+        continue-on-error: true
+
+      - name: Build Flutter web
+        id: build
+        run: |
+          flutter build web --release --base-href "/${{ github.event.repository.name }}/"
+          echo "Build completed successfully"
+
+      - name: Verify build output
+        run: |
+          ls -la build/web/
+          test -f build/web/index.html
+
+      - name: Setup Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact for Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'build/web'
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-web-build
+          path: build/web
+          retention-days: 7
+
+  deploy-pages:
+    if: github.event_name != 'pull_request' && (github.event.inputs.deploy_target == 'github_pages' || github.event.inputs.deploy_target == '')
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Output deployment URL
+        run: |
+          echo "::notice::Deployed to ${{ steps.deployment.outputs.page_url }}"
+
+  deploy-vercel:
+    if: github.event.inputs.deploy_target == 'vercel'
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flutter-web-build
+          path: build/web
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Deploy to Vercel
+        id: vercel-deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          cd build/web
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            vercel deploy --prod --token=$VERCEL_TOKEN --yes
+          else
+            vercel deploy --token=$VERCEL_TOKEN --yes
+          fi
+
+  notify:
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [build, deploy-pages]
+    
+    steps:
+      - name: Check deployment status
+        run: |
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            echo "::notice::Build completed successfully"
+          else
+            echo "::error::Build failed"
+          fi
+          
+          if [ "${{ needs.deploy-pages.result }}" == "success" ]; then
+            echo "::notice::Deployment to GitHub Pages completed"
+          elif [ "${{ needs.deploy-pages.result }}" == "failure" ]; then
+            echo "::error::Deployment to GitHub Pages failed"
+          fi
